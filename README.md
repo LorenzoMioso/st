@@ -1,4 +1,4 @@
-Similar to [dwm-flexipatch](https://github.com/bakkeby/dwm-flexipatch) this st 0.8.4 (46b02f, 2021-03-28) project has a different take on st patching. It uses preprocessor directives to decide whether or not to include a patch during build time. Essentially this means that this build, for better or worse, contains both the patched _and_ the original code. The aim being that you can select which patches to include and the build will contain that code and nothing more.
+Similar to [dwm-flexipatch](https://github.com/bakkeby/dwm-flexipatch) this st 0.9 (e5e9598, 2022-10-25) project has a different take on st patching. It uses preprocessor directives to decide whether or not to include a patch during build time. Essentially this means that this build, for better or worse, contains both the patched _and_ the original code. The aim being that you can select which patches to include and the build will contain that code and nothing more.
 
 For example to include the `alpha` patch then you would only need to flip this setting from 0 to 1 in [patches.h](https://github.com/bakkeby/st-flexipatch/blob/master/patches.def.h):
 ```c
@@ -14,6 +14,26 @@ Refer to [https://st.suckless.org/](https://st.suckless.org/) for details on the
 ---
 
 ### Changelog:
+
+2022-10-24 - Added the fullscreen patch
+
+2022-08-28 - Added the use XftFontMatch patch
+
+2022-08-24 - Added the no window decorations patch
+
+2022-04-11 - Added the background image reload patch
+
+2022-03-10 - Added the background image patch
+
+2022-02-24 - Upgraded to st 0.8.5 e823e23, 2022-02-17 - removing osc_10_11_12_2 patch as no longer relevant
+
+2021-08-18 - Added the CSI 22 & 23 patch
+
+2021-07-26 - Added columns patch
+
+2021-07-07 - Added sixel scrollback and the openurlonclick patch
+
+2021-06-09 - Added the hide terminal cursor patch
 
 2021-05-16 - Added swapmouse patch
 
@@ -81,8 +101,16 @@ Refer to [https://st.suckless.org/](https://st.suckless.org/) for details on the
    - [anysize](https://st.suckless.org/patches/anysize/)
       - allows st to reize to any pixel size rather than snapping to character width / height
 
-   - [anysize_nobar](https://github.com/connor-brooks/st-anysize-nobar)
-      - a patch that aims to prevent black bars being drawn on the edges of st terminals using the anysize patch
+   - [~anysize\_nobar~](https://github.com/connor-brooks/st-anysize-nobar)
+      - ~a patch that aims to prevent black bars being drawn on the edges of st terminals using the
+        anysize patch~
+
+   - [background-image](https://st.suckless.org/patches/background_image/)
+      - draws a background image in farbfeld format in place of the defaultbg color allowing for
+        pseudo transparency
+
+   - background-image-reload
+      - allows the background image to be reloaded similar to xresources using USR1 signals
 
    - [blinking-cursor](https://st.suckless.org/patches/blinking_cursor/)
       - allows the use of a blinking cursor
@@ -98,9 +126,17 @@ Refer to [https://st.suckless.org/](https://st.suckless.org/) for details on the
       - by default st only sets PRIMARY on selection
       - this patch makes st set CLIPBOARD on selection
 
+   - [columns](https://github.com/bakkeby/st-flexipatch/issues/34)
+      - allows st to be resized without cutting off text when the terminal window is made larger again
+      - text does not wrap when the terminal window is made smaller
+
    - [copyurl](https://st.suckless.org/patches/copyurl/)
       - this patch allows you to select and copy the last URL displayed with Mod+l
       - multiple invocations cycle through the available URLs
+
+   - [csi\_23\_23](https://st.suckless.org/patches/csi_22_23/)
+      - adds support for CSI escape sequences 22 and 23, which save and restores the window title
+        (for instance nvim does this when opening and closing)
 
    - default-cursor
       - minor change allowing escape sequences like `\e[ q` or `\e[0 q` to set the cursor back to default configuration instead of a blinking block
@@ -120,7 +156,7 @@ Refer to [https://st.suckless.org/](https://st.suckless.org/) for details on the
       - this patch makes the cursor color the inverse of the current cell color
 
    - [externalpipe](https://st.suckless.org/patches/externalpipe/)
-      - this patch allows for eading and writing st's screen through a pipe, e.g. to pass info to dmenu
+      - this patch allows for reading and writing st's screen through a pipe, e.g. to pass info to dmenu
 
    - [externalpipein](https://lists.suckless.org/hackers/2004/17218.html)
       - this patch prevents the reset of the signal handler set on SIGCHILD, when the forked process that executes the external process exits
@@ -140,12 +176,18 @@ Refer to [https://st.suckless.org/](https://st.suckless.org/) for details on the
    - [~force-redraw-after-keypress~](https://lists.suckless.org/hackers/2004/17221.html)
       - ~this patch forces the terminal to check for new data on the tty on keypress with the aim of reducing input latency~
 
+   - [fullscreen](https://st.suckless.org/patches/fullscreen/)
+      - allows the st window to go into fullscreen mode
+
    - [gradient](https://st.suckless.org/patches/gradient/)
       - adds gradient transparency to st
       - depends on the alpha patch
 
    - [hidecursor](https://st.suckless.org/patches/hidecursor/)
       - hides the X cursor whenever a key is pressed and show it back when the mouse is moved in the terminal window
+
+   - [hide-terminal-cursor](https://www.reddit.com/r/suckless/comments/nvee8h/how_to_hide_cursor_in_st_is_there_a_patch_for_it/)
+      - hides the terminal cursor when the window loses focus (as opposed to showing a hollow cursor)
 
    - [invert](https://st.suckless.org/patches/invert/)
       - adds a keybinding that lets you invert the current colorscheme of st
@@ -170,16 +212,22 @@ Refer to [https://st.suckless.org/](https://st.suckless.org/) for details on the
       - allows you to spawn a new st terminal using Ctrl-Shift-Return
       - it will have the same CWD (current working directory) as the original st instance
 
+   - [no-window-decorations](https://github.com/bakkeby/patches/wiki/no_window_decorations)
+      - makes st show without window decorations if the WM supports it
+
    - [open-copied-url](https://st.suckless.org/patches/open_copied_url/)
       - open contents of the clipboard in a user-defined browser
 
-   - [osc_10_11_12_2](https://st.suckless.org/patches/osc_10_11_12_2/)
-      - this patch adds support for OSC escape sequences 10, 11, and 12 in the way they are
-        implemented in most other terminals (e.g libvte, kitty)
-      - specifically it differs from [osc_10_11_12](https://st.suckless.org/patches/osc_10_11_12/)
-        in that it treats the background and foreground colors as distinct from palette colours 01
-        and 07 in order to facilitate the use of theme setting scripts like
-        [theme.sh](https://github.com/lemnos/theme.sh) which expect these colours to be distinct
+   - [openurlonclick](https://www.reddit.com/r/suckless/comments/cc83om/st_open_url/)
+      - allows for URLs to be opened directly when you click on them
+
+   - [~osc\_10\_11\_12\_2~](https://st.suckless.org/patches/osc_10_11_12_2/)
+      - ~this patch adds support for OSC escape sequences 10, 11, and 12 in the way they are~
+        ~implemented in most other terminals (e.g libvte, kitty)~
+      - ~specifically it differs from~ [~osc_10_11_12~](https://st.suckless.org/patches/osc_10_11_12/)
+        ~in that it treats the background and foreground colors as distinct from palette colours 01~
+        ~and 07 in order to facilitate the use of theme setting scripts like~
+        [~theme.sh~](https://github.com/lemnos/theme.sh) ~which expect these colours to be distinct~
 
    - [relativeborder](https://st.suckless.org/patches/relativeborder/)
       - allows you to specify a border that is relative in size to the width of a cell in the
@@ -222,6 +270,10 @@ Refer to [https://st.suckless.org/](https://st.suckless.org/) for details on the
    - [universcroll](https://st.suckless.org/patches/universcroll/)
       - allows mouse scroll without modifier keys for regardless of alt screen using the external
         scroll program
+
+   - [use-XftFontMatch](https://git.suckless.org/st/commit/528241aa3835e2f1f052abeeaf891737712955a0.html)
+      - use XftFontMatch in place of FcFontMatch to allow font to scale with Xft.dpi resource
+        setting
 
    - [vertcenter](https://st.suckless.org/patches/vertcenter/)
       - vertically center lines in the space available if you have set a larger chscale in config.h

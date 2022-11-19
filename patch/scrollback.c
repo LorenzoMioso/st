@@ -14,6 +14,15 @@ kscrolldown(const Arg* a)
 		selscroll(0, -n);
 		tfulldirt();
 	}
+
+	#if SIXEL_PATCH
+	scroll_images(-1*n);
+	#endif // SIXEL_PATCH
+
+	#if OPENURLONCLICK_PATCH
+	if (n > 0)
+		restoremousecursor();
+	#endif // OPENURLONCLICK_PATCH
 }
 
 void
@@ -23,9 +32,24 @@ kscrollup(const Arg* a)
 	if (n < 0)
 		n = term.row + n;
 
+	if (term.scr + n > term.histn)
+		n = term.histn - term.scr;
+
+	if (!n)
+		return;
+
 	if (term.scr <= HISTSIZE-n) {
 		term.scr += n;
 		selscroll(0, n);
 		tfulldirt();
 	}
+
+	#if SIXEL_PATCH
+	scroll_images(n);
+	#endif // SIXEL_PATCH
+
+	#if OPENURLONCLICK_PATCH
+	if (n > 0)
+		restoremousecursor();
+	#endif // OPENURLONCLICK_PATCH
 }

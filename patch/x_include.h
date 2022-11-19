@@ -1,4 +1,10 @@
 /* Patches */
+#if ALPHA_PATCH
+#include "alpha.h"
+#endif
+#if BACKGROUND_IMAGE_PATCH
+#include "background_image_x.h"
+#endif
 #if BOXDRAW_PATCH
 #include "boxdraw.h"
 #endif
@@ -7,6 +13,9 @@
 #endif
 #if FONT2_PATCH
 #include "font2.h"
+#endif
+#if FULLSCREEN_PATCH
+#include "fullscreen_x.h"
 #endif
 #if INVERT_PATCH
 #include "invert.h"

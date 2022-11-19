@@ -27,10 +27,20 @@ char *argv0;
 #include <X11/Xcursor/Xcursor.h>
 #endif // THEMED_CURSOR_PATCH
 
+#if UNDERCURL_PATCH
+/* Undercurl slope types */
+enum undercurl_slope_type {
+	UNDERCURL_SLOPE_ASCENDING = 0,
+	UNDERCURL_SLOPE_TOP_CAP = 1,
+	UNDERCURL_SLOPE_DESCENDING = 2,
+	UNDERCURL_SLOPE_BOTTOM_CAP = 3
+};
+#endif // UNDERCURL_PATCH
+
 /* X modifiers */
 #define XK_ANY_MOD    UINT_MAX
 #define XK_NO_MOD     0
-#define XK_SWITCH_MOD (1<<13)
+#define XK_SWITCH_MOD (1<<13|1<<14)
 
 /* function definitions used in config.h */
 static void clipcopy(const Arg *);
@@ -47,6 +57,11 @@ static void zoomreset(const Arg *);
 
 /* config.h for applying patches and the configuration. */
 #include "config.h"
+
+#if CSI_22_23_PATCH
+/* size of title stack */
+#define TITLESTACKSIZE 8
+#endif // CSI_22_23_PATCH
 
 /* XEMBED messages */
 #define XEMBED_FOCUS_IN  4
@@ -102,6 +117,9 @@ static void selnotify(XEvent *);
 static void selclear_(XEvent *);
 static void selrequest(XEvent *);
 static void setsel(char *, Time);
+#if XRESOURCES_PATCH && XRESOURCES_RELOAD_PATCH || BACKGROUND_IMAGE_PATCH && BACKGROUND_IMAGE_RELOAD_PATCH
+static void sigusr1_reload(int sig);
+#endif // XRESOURCES_RELOAD_PATCH | BACKGROUND_IMAGE_RELOAD_PATCH
 static int mouseaction(XEvent *, uint);
 static void mousesel(XEvent *, int);
 static void mousereport(XEvent *);
@@ -148,6 +166,11 @@ XWindow xw;
 XSelection xsel;
 TermWindow win;
 
+#if CSI_22_23_PATCH
+static int tstki; /* title stack index */
+static char *titlestack[TITLESTACKSIZE]; /* title stack */
+#endif // CSI_22_23_PATCH
+
 /* Font Ring Cache */
 enum {
 	FRC_NORMAL,
@@ -189,7 +212,7 @@ static char *opt_dir   = NULL;
 static int focused = 0;
 #endif // ALPHA_FOCUS_HIGHLIGHT_PATCH
 
-static int oldbutton = 3; /* button event on startup: 3 = release */
+static uint buttons; /* bit field of pressed buttons */
 #if BLINKING_CURSOR_PATCH
 static int cursorblinks = 0;
 #endif // BLINKING_CURSOR_PATCH
@@ -310,41 +333,27 @@ evrow(XEvent *e)
 uint
 buttonmask(uint button)
 {
-       return button == Button1 ? Button1Mask
-            : button == Button2 ? Button2Mask
-            : button == Button3 ? Button3Mask
-            : button == Button4 ? Button4Mask
-            : button == Button5 ? Button5Mask
-            : 0;
+	return button == Button1 ? Button1Mask
+		: button == Button2 ? Button2Mask
+		: button == Button3 ? Button3Mask
+		: button == Button4 ? Button4Mask
+		: button == Button5 ? Button5Mask
+		: 0;
 }
 
 int
 mouseaction(XEvent *e, uint release)
 {
 	MouseShortcut *ms;
+	int screen = tisaltscr() ? S_ALT : S_PRI;
 
 	/* ignore Button<N>mask for Button<N> - it's set on release */
 	uint state = e->xbutton.state & ~buttonmask(e->xbutton.button);
 
-	#if SCROLLBACK_MOUSE_ALTSCREEN_PATCH
-	if (tisaltscr())
-		for (ms = maltshortcuts; ms < maltshortcuts + LEN(maltshortcuts); ms++) {
-			if (ms->release == release &&
-					ms->button == e->xbutton.button &&
-					(match(ms->mod, state) ||  /* exact or forced */
-					 match(ms->mod, state & ~forcemousemod))) {
-				ms->func(&(ms->arg));
-				return 1;
-			}
-		}
-	else
-	#endif // SCROLLBACK_MOUSE_ALTSCREEN_PATCH
 	for (ms = mshortcuts; ms < mshortcuts + LEN(mshortcuts); ms++) {
 		if (ms->release == release &&
 				ms->button == e->xbutton.button &&
-				#if UNIVERSCROLL_PATCH
-				(!ms->altscrn || (ms->altscrn == (tisaltscr() ? 1 : -1))) &&
-				#endif // UNIVERSCROLL_PATCH
+				(!ms->screen || (ms->screen == screen)) &&
 				(match(ms->mod, state) ||  /* exact or forced */
 				 match(ms->mod, state & ~forcemousemod))) {
 			ms->func(&(ms->arg));
@@ -375,61 +384,69 @@ mousesel(XEvent *e, int done)
 void
 mousereport(XEvent *e)
 {
-	int len, x = evcol(e), y = evrow(e),
-	    button = e->xbutton.button, state = e->xbutton.state;
+	int len, btn, code;
+	int x = evcol(e), y = evrow(e);
+	int state = e->xbutton.state;
 	char buf[40];
 	static int ox, oy;
 
-	/* from urxvt */
-	if (e->xbutton.type == MotionNotify) {
+	if (e->type == MotionNotify) {
 		if (x == ox && y == oy)
 			return;
 		if (!IS_SET(MODE_MOUSEMOTION) && !IS_SET(MODE_MOUSEMANY))
 			return;
-		/* MOUSE_MOTION: no reporting if no button is pressed */
-		if (IS_SET(MODE_MOUSEMOTION) && oldbutton == 3)
+		/* MODE_MOUSEMOTION: no reporting if no button is pressed */
+		if (IS_SET(MODE_MOUSEMOTION) && buttons == 0)
 			return;
 
-		button = oldbutton + 32;
-		ox = x;
-		oy = y;
+		/* Set btn to lowest-numbered pressed button, or 12 if no
+		 * buttons are pressed. */
+		for (btn = 1; btn <= 11 && !(buttons & (1<<(btn-1))); btn++)
+			;
+		code = 32;
 	} else {
-		if (!IS_SET(MODE_MOUSESGR) && e->xbutton.type == ButtonRelease) {
-			button = 3;
-		} else {
-			button -= Button1;
-			if (button >= 7)
-				button += 128 - 7;
-			else if (button >= 3)
-				button += 64 - 3;
-		}
-		if (e->xbutton.type == ButtonPress) {
-			oldbutton = button;
-			ox = x;
-			oy = y;
-		} else if (e->xbutton.type == ButtonRelease) {
-			oldbutton = 3;
+		btn = e->xbutton.button;
+		/* Only buttons 1 through 11 can be encoded */
+		if (btn < 1 || btn > 11)
+			return;
+		if (e->type == ButtonRelease) {
 			/* MODE_MOUSEX10: no button release reporting */
 			if (IS_SET(MODE_MOUSEX10))
 				return;
-			if (button == 64 || button == 65)
+			/* Don't send release events for the scroll wheel */
+			if (btn == 4 || btn == 5)
 				return;
 		}
+		code = 0;
 	}
 
+	ox = x;
+	oy = y;
+
+	/* Encode btn into code. If no button is pressed for a motion event in
+	 * MODE_MOUSEMANY, then encode it as a release. */
+	if ((!IS_SET(MODE_MOUSESGR) && e->type == ButtonRelease) || btn == 12)
+		code += 3;
+	else if (btn >= 8)
+		code += 128 + btn - 8;
+	else if (btn >= 4)
+		code += 64 + btn - 4;
+	else
+		code += btn - 1;
+
 	if (!IS_SET(MODE_MOUSEX10)) {
-		button += ((state & ShiftMask  ) ? 4  : 0)
-			+ ((state & Mod4Mask   ) ? 8  : 0)
-			+ ((state & ControlMask) ? 16 : 0);
+		code += ((state & ShiftMask  ) ?  4 : 0)
+		      + ((state & Mod1Mask   ) ?  8 : 0) /* meta key: alt */
+		      + ((state & ControlMask) ? 16 : 0);
 	}
 
 	if (IS_SET(MODE_MOUSESGR)) {
 		len = snprintf(buf, sizeof(buf), "\033[<%d;%d;%d%c",
-				button, x+1, y+1,
-				e->xbutton.type == ButtonRelease ? 'm' : 'M');
+				code, x+1, y+1,
+				e->type == ButtonRelease ? 'm' : 'M');
 	} else if (x < 223 && y < 223) {
 		len = snprintf(buf, sizeof(buf), "\033[M%c%c%c",
-				32+button, 32+x+1, 32+y+1);
+				32+code, 32+x+1, 32+y+1);
 	} else {
 		return;
 	}
@@ -440,10 +457,14 @@ mousereport(XEvent *e)
 void
 bpress(XEvent *e)
 {
+	int btn = e->xbutton.button;
 	struct timespec now;
 	#if !VIM_BROWSE_PATCH
 	int snap;
 	#endif // VIM_BROWSE_PATCH
+
+	if (1 <= btn && btn <= 11)
+		buttons |= 1 << (btn-1);
 
 	if (IS_SET(MODE_MOUSE) && !(e->xbutton.state & forcemousemod)) {
 		mousereport(e);
@@ -453,7 +474,7 @@ bpress(XEvent *e)
 	if (mouseaction(e, 0))
 		return;
 
-	if (e->xbutton.button == Button1) {
+	if (btn == Button1) {
 		/*
 		 * If the user clicks below predefined timeouts specific
 		 * snapping behaviour is exposed.
@@ -501,6 +522,11 @@ bpress(XEvent *e)
 		#if !VIM_BROWSE_PATCH
 		selstart(evcol(e), evrow(e), snap);
 		#endif // VIM_BROWSE_PATCH
+
+		#if OPENURLONCLICK_PATCH
+		clearurl();
+		url_click = 1;
+		#endif // OPENURLONCLICK_PATCH
 	}
 }
 
@@ -516,6 +542,14 @@ propnotify(XEvent *e)
 			 xpev->atom == clipboard)) {
 		selnotify(e);
 	}
+
+	#if BACKGROUND_IMAGE_PATCH
+	if (pseudotransparency &&
+		!strncmp(XGetAtomName(xw.dpy, e->xproperty.atom), "_NET_WM_STATE", 13)) {
+		updatexy();
+		redraw();
+	}
+	#endif // BACKGROUND_IMAGE_PATCH
 }
 
 void
@@ -546,7 +580,12 @@ selnotify(XEvent *e)
 			return;
 		}
 
-		if (e->type == PropertyNotify && nitems == 0 && rem == 0) {
+		#if BACKGROUND_IMAGE_PATCH
+		if (e->type == PropertyNotify && nitems == 0 && rem == 0 && !pseudotransparency)
+		#else
+		if (e->type == PropertyNotify && nitems == 0 && rem == 0)
+		#endif // BACKGROUND_IMAGE_PATCH
+		{
 			/*
 			 * If there is some PropertyNotify with no data, then
 			 * this is the signal of the selection owner that all
@@ -564,9 +603,15 @@ selnotify(XEvent *e)
 			 * when the selection owner does send us the next
 			 * chunk of data.
 			 */
+			#if BACKGROUND_IMAGE_PATCH
+			if (!pseudotransparency) {
+			#endif // BACKGROUND_IMAGE_PATCH
 			MODBIT(xw.attrs.event_mask, 1, PropertyChangeMask);
 			XChangeWindowAttributes(xw.dpy, xw.win, CWEventMask,
 					&xw.attrs);
+			#if BACKGROUND_IMAGE_PATCH
+			}
+			#endif // BACKGROUND_IMAGE_PATCH
 
 			/*
 			 * Deleting the property is the transfer start signal.
@@ -693,6 +738,20 @@ setsel(char *str, Time t)
 	#endif // CLIPBOARD_PATCH
 }
 
+#if XRESOURCES_PATCH && XRESOURCES_RELOAD_PATCH || BACKGROUND_IMAGE_PATCH && BACKGROUND_IMAGE_RELOAD_PATCH
+void
+sigusr1_reload(int sig)
+{
+	#if XRESOURCES_PATCH && XRESOURCES_RELOAD_PATCH
+	reload_config(sig);
+	#endif // XRESOURCES_RELOAD_PATCH
+	#if BACKGROUND_IMAGE_PATCH && BACKGROUND_IMAGE_RELOAD_PATCH
+	reload_image();
+	#endif // BACKGROUND_IMAGE_RELOAD_PATCH
+	signal(SIGUSR1, sigusr1_reload);
+}
+#endif // XRESOURCES_RELOAD_PATCH | BACKGROUND_IMAGE_RELOAD_PATCH
+
 void
 xsetsel(char *str)
 {
@@ -702,6 +761,11 @@ xsetsel(char *str)
 void
 brelease(XEvent *e)
 {
+	int btn = e->xbutton.button;
+
+	if (1 <= btn && btn <= 11)
+		buttons &= ~(1 << (btn-1));
+
 	if (IS_SET(MODE_MOUSE) && !(e->xbutton.state & forcemousemod)) {
 		mousereport(e);
 		return;
@@ -710,14 +774,24 @@ brelease(XEvent *e)
 	if (mouseaction(e, 1))
 		return;
 	#if VIM_BROWSE_PATCH
-	if (e->xbutton.button == Button1 && !IS_SET(MODE_NORMAL))
+	if (btn == Button1 && !IS_SET(MODE_NORMAL)) {
 		mousesel(e, 1);
+		#if OPENURLONCLICK_PATCH
+		if (url_click && e->xkey.state & url_opener_modkey)
+			openUrlOnClick(evcol(e), evrow(e), url_opener);
+		#endif // OPENURLONCLICK_PATCH
+	}
 	#else
-	if (e->xbutton.button == Button1)
+	if (btn == Button1) {
 		mousesel(e, 1);
+		#if OPENURLONCLICK_PATCH
+		if (url_click && e->xkey.state & url_opener_modkey)
+			openUrlOnClick(evcol(e), evrow(e), url_opener);
+		#endif // OPENURLONCLICK_PATCH
+	}
 	#endif // VIM_BROWSE_PATCH
 	#if RIGHTCLICKTOPLUMB_PATCH
-	else if (e->xbutton.button == Button3)
+	else if (btn == Button3)
 		plumb(xsel.primary);
 	#endif // RIGHTCLICKTOPLUMB_PATCH
 }
@@ -740,6 +814,18 @@ bmotion(XEvent *e)
 			xsetpointermotion(0);
 	}
 	#endif // HIDECURSOR_PATCH
+	#if OPENURLONCLICK_PATCH
+	#if VIM_BROWSE_PATCH
+	if (!IS_SET(MODE_NORMAL))
+	#endif // VIM_BROWSE_PATCH
+	if (!IS_SET(MODE_MOUSE)) {
+		if (!(e->xbutton.state & Button1Mask) && detecturl(evcol(e), evrow(e), 1))
+			XDefineCursor(xw.dpy, xw.win, xw.upointer);
+		else
+			XDefineCursor(xw.dpy, xw.win, xw.vpointer);
+	}
+	url_click = 0;
+	#endif // OPENURLONCLICK_PATCH
 
 	if (IS_SET(MODE_MOUSE) && !(e->xbutton.state & forcemousemod)) {
 		mousereport(e);
@@ -830,6 +916,10 @@ xloadcolor(int i, const char *name, Color *ncolor)
 #if VIM_BROWSE_PATCH
 void normalMode()
 {
+	#if OPENURLONCLICK_PATCH
+	clearurl();
+	restoremousecursor();
+	#endif // OPENURLONCLICK_PATCH
 	historyModeToggle((win.mode ^=MODE_NORMAL) & MODE_NORMAL);
 }
 #endif // VIM_BROWSE_PATCH
@@ -907,6 +997,19 @@ xloadcols(void)
 #endif // ALPHA_FOCUS_HIGHLIGHT_PATCH
 
 int
+xgetcolor(int x, unsigned char *r, unsigned char *g, unsigned char *b)
+{
+	if (!BETWEEN(x, 0, dc.collen))
+		return 1;
+
+	*r = dc.col[x].color.red >> 8;
+	*g = dc.col[x].color.green >> 8;
+	*b = dc.col[x].color.blue >> 8;
+
+	return 0;
+}
+
+int
 xsetcolorname(int x, const char *name)
 {
 	Color ncolor;
@@ -939,7 +1042,11 @@ xsetcolorname(int x, const char *name)
 void
 xclear(int x1, int y1, int x2, int y2)
 {
-	#if INVERT_PATCH
+	#if BACKGROUND_IMAGE_PATCH
+	if (pseudotransparency)
+		XSetTSOrigin(xw.dpy, xw.bggc, -win.x, -win.y);
+	XFillRectangle(xw.dpy, xw.buf, xw.bggc, x1, y1, x2-x1, y2-y1);
+	#elif INVERT_PATCH
 	Color c;
 	c = dc.col[IS_SET(MODE_REVERSE)? defaultfg : defaultbg];
 	if (invertcolors) {
@@ -977,7 +1084,7 @@ xhints(void)
 	sizeh->flags = PSize | PResizeInc | PBaseSize | PMinSize;
 	sizeh->height = win.h;
 	sizeh->width = win.w;
-	#if ANYSIZE_PATCH
+	#if ANYSIZE_PATCH || ANYSIZE_SIMPLE_PATCH
 	sizeh->height_inc = 1;
 	sizeh->width_inc = 1;
 	#else
@@ -1095,7 +1202,11 @@ xloadfont(Font *f, FcPattern *pattern)
 	FcConfigSubstitute(NULL, configured, FcMatchPattern);
 	XftDefaultSubstitute(xw.dpy, xw.scr, configured);
 
+	#if USE_XFTFONTMATCH_PATCH
+	match = XftFontMatch(xw.dpy, xw.scr, pattern, &result);
+	#else
 	match = FcFontMatch(NULL, configured, &result);
+	#endif // USE_XFTFONTMATCH_PATCH
 	if (!match) {
 		FcPatternDestroy(configured);
 		return 1;
@@ -1279,8 +1390,10 @@ xinit(int cols, int rows)
 	XVisualInfo vis;
 	#endif // ALPHA_PATCH
 
+	#if !XRESOURCES_PATCH
 	if (!(xw.dpy = XOpenDisplay(NULL)))
 		die("can't open display\n");
+	#endif // XRESOURCES_PATCH
 	xw.scr = XDefaultScreen(xw.dpy);
 
 	#if ALPHA_PATCH
@@ -1343,6 +1456,9 @@ xinit(int cols, int rows)
 		#endif // ST_EMBEDDER_PATCH
 		;
 	xw.attrs.colormap = xw.cmap;
+	#if OPENURLONCLICK_PATCH
+	xw.attrs.event_mask |= PointerMotionMask;
+	#endif // OPENURLONCLICK_PATCH
 
 	#if !ALPHA_PATCH
 	if (!(opt_embed && (parent = strtol(opt_embed, NULL, 0))))
@@ -1434,6 +1550,14 @@ xinit(int cols, int rows)
 	XRecolorCursor(xw.dpy, cursor, &xmousefg, &xmousebg);
 	#endif // HIDECURSOR_PATCH
 
+	#if OPENURLONCLICK_PATCH
+	xw.upointer = XCreateFontCursor(xw.dpy, XC_hand2);
+	#if !HIDECURSOR_PATCH
+	xw.vpointer = cursor;
+	xw.pointerisvisible = 1;
+	#endif // HIDECURSOR_PATCH
+	#endif // OPENURLONCLICK_PATCH
+
 	xw.xembed = XInternAtom(xw.dpy, "_XEMBED", False);
 	xw.wmdeletewin = XInternAtom(xw.dpy, "WM_DELETE_WINDOW", False);
 	xw.netwmname = XInternAtom(xw.dpy, "_NET_WM_NAME", False);
@@ -1446,9 +1570,21 @@ xinit(int cols, int rows)
 			PropModeReplace, (uchar *)&icon, LEN(icon));
 	#endif //NETWMICON_PATCH
 
+	#if NO_WINDOW_DECORATIONS_PATCH
+	Atom motifwmhints = XInternAtom(xw.dpy, "_MOTIF_WM_HINTS", False);
+	unsigned int data[] = { 0x2, 0x0, 0x0, 0x0, 0x0 };
+	XChangeProperty(xw.dpy, xw.win, motifwmhints, motifwmhints, 16,
+				PropModeReplace, (unsigned char *)data, 5);
+	#endif // NO_WINDOW_DECORATIONS_PATCH
+
 	xw.netwmpid = XInternAtom(xw.dpy, "_NET_WM_PID", False);
 	XChangeProperty(xw.dpy, xw.win, xw.netwmpid, XA_CARDINAL, 32,
 			PropModeReplace, (uchar *)&thispid, 1);
+
+	#if FULLSCREEN_PATCH
+	xw.netwmstate = XInternAtom(xw.dpy, "_NET_WM_STATE", False);
+	xw.netwmfullscreen = XInternAtom(xw.dpy, "_NET_WM_STATE_FULLSCREEN", False);
+	#endif // FULLSCREEN_PATCH
 
 	win.mode = MODE_NUMLOCK;
 	resettitle();
@@ -1594,12 +1730,12 @@ xmakeglyphfontspecs(XftGlyphFontSpec *specs, const Glyph *glyphs, int len, int x
 					fccharset);
 			FcPatternAddBool(fcpattern, FC_SCALABLE, 1);
 
-			FcConfigSubstitute(0, fcpattern,
-					FcMatchPattern);
+			#if !USE_XFTFONTMATCH_PATCH
+			FcConfigSubstitute(0, fcpattern, FcMatchPattern);
 			FcDefaultSubstitute(fcpattern);
+			#endif // USE_XFTFONTMATCH_PATCH
 
-			fontpattern = FcFontSetMatch(0, fcsets, 1,
-					fcpattern, &fcres);
+			fontpattern = FcFontSetMatch(0, fcsets, 1, fcpattern, &fcres);
 
 			/* Allocate memory for the new cache entry. */
 			if (frclen >= frccap) {
@@ -1640,6 +1776,53 @@ xmakeglyphfontspecs(XftGlyphFontSpec *specs, const Glyph *glyphs, int len, int x
 	return numspecs;
 }
 
+#if UNDERCURL_PATCH
+static int isSlopeRising (int x, int iPoint, int waveWidth)
+{
+	//    .     .     .     .
+	//   / \   / \   / \   / \
+	//  /   \ /   \ /   \ /   \
+	// .     .     .     .     .
+
+	// Find absolute `x` of point
+	x += iPoint * (waveWidth/2);
+
+	// Find index of absolute wave
+	int absSlope = x / ((float)waveWidth/2);
+
+	return (absSlope % 2);
+}
+
+static int getSlope (int x, int iPoint, int waveWidth)
+{
+	// Sizes: Caps are half width of slopes
+	//    1_2       1_2       1_2      1_2
+	//   /   \     /   \     /   \    /   \
+	//  /     \   /     \   /     \  /     \
+	// 0       3_0       3_0      3_0       3_
+	// <2->    <1>         <---6---->
+
+	// Find type of first point
+	int firstType;
+	x -= (x / waveWidth) * waveWidth;
+	if (x < (waveWidth * (2.f/6.f)))
+		firstType = UNDERCURL_SLOPE_ASCENDING;
+	else if (x < (waveWidth * (3.f/6.f)))
+		firstType = UNDERCURL_SLOPE_TOP_CAP;
+	else if (x < (waveWidth * (5.f/6.f)))
+		firstType = UNDERCURL_SLOPE_DESCENDING;
+	else
+		firstType = UNDERCURL_SLOPE_BOTTOM_CAP;
+
+	// Find type of given point
+	int pointType = (iPoint % 4);
+	pointType += firstType;
+	pointType %= 4;
+
+	return pointType;
+}
+#endif // UNDERCURL_PATCH
+
 void
 #if WIDE_GLYPHS_PATCH
 xdrawglyphfontspecs(const XftGlyphFontSpec *specs, Glyph base, int len, int x, int y, int dmode)
@@ -1656,9 +1839,7 @@ xdrawglyphfontspecs(const XftGlyphFontSpec *specs, Glyph base, int len, int x, i
 	int width = charlen * win.cw;
 	Color *fg, *bg, *temp, revfg, revbg, truefg, truebg;
 	XRenderColor colfg, colbg;
-	#if !WIDE_GLYPHS_PATCH
 	XRectangle r;
-	#endif // WIDE_GLYPHS_PATCH
 
 	/* Fallback on color display for attributes not supported by the font */
 	if (base.mode & ATTR_ITALIC && base.mode & ATTR_BOLD) {
@@ -1777,7 +1958,7 @@ xdrawglyphfontspecs(const XftGlyphFontSpec *specs, Glyph base, int len, int x, i
 	/* Intelligent cleaning up of the borders. */
 	#if ANYSIZE_PATCH
 	if (x == 0) {
-		xclear(0, (y == 0)? 0 : winy, win.vborderpx,
+		xclear(0, (y == 0)? 0 : winy, win.hborderpx,
 			winy + win.ch +
 			((winy + win.ch >= win.vborderpx + win.th)? win.h : 0));
 	}
@@ -1786,7 +1967,7 @@ xdrawglyphfontspecs(const XftGlyphFontSpec *specs, Glyph base, int len, int x, i
 			((winy + win.ch >= win.vborderpx + win.th)? win.h : (winy + win.ch)));
 	}
 	if (y == 0)
-		xclear(winx, 0, winx + width, win.hborderpx);
+		xclear(winx, 0, winx + width, win.vborderpx);
 	if (winy + win.ch >= win.vborderpx + win.th)
 		xclear(winx, winy + win.ch, winx + width, win.h);
 	#else
@@ -1806,18 +1987,27 @@ xdrawglyphfontspecs(const XftGlyphFontSpec *specs, Glyph base, int len, int x, i
 	#endif // ANYSIZE_PATCH
 
 	/* Clean up the region we want to draw to. */
-	XftDrawRect(xw.draw, bg, winx, winy, width, win.ch);
-	#if WIDE_GLYPHS_PATCH
-	}
-	#endif // WIDE_GLYPHS_PATCH
+	#if BACKGROUND_IMAGE_PATCH
+	if (bg == &dc.col[defaultbg])
+		xclear(winx, winy, winx + width, winy + win.ch);
+	else
+	#endif // BACKGROUND_IMAGE_PATCH
 
 	#if !WIDE_GLYPHS_PATCH
+	XftDrawRect(xw.draw, bg, winx, winy, width, win.ch);
+	#endif // WIDE_GLYPHS_PATCH
+
 	/* Set the clip region because Xft is sometimes dirty. */
 	r.x = 0;
 	r.y = 0;
 	r.height = win.ch;
 	r.width = width;
 	XftDrawSetClipRectangles(xw.draw, winx, winy, &r, 1);
+
+	#if WIDE_GLYPHS_PATCH
+		/* Fill the background */
+		XftDrawRect(xw.draw, bg, winx, winy, width, win.ch);
+	}
 	#endif // WIDE_GLYPHS_PATCH
 
 	#if WIDE_GLYPHS_PATCH
@@ -1839,7 +2029,8 @@ xdrawglyphfontspecs(const XftGlyphFontSpec *specs, Glyph base, int len, int x, i
 	if (base.mode & ATTR_UNDERLINE) {
 		#if UNDERCURL_PATCH
 		// Underline Color
-		int wlw = 1; // Wave Line Width
+		const int widthThreshold  = 28; // +1 width every widthThreshold px of font
+		int wlw = (win.ch / widthThreshold) + 1; // Wave Line Width
 		int linecolor;
 		if ((base.ucolor[0] >= 0) &&
 			!(base.mode & ATTR_BLINK && win.mode & MODE_BLINK) &&
@@ -1878,9 +2069,8 @@ xdrawglyphfontspecs(const XftGlyphFontSpec *specs, Glyph base, int len, int x, i
 
 		// Underline Style
 		if (base.ustyle != 3) {
-			//XftDrawRect(xw.draw, fg, winx, winy + dc.font.ascent + 1, width, 1);
 			XFillRectangle(xw.dpy, XftDrawDrawable(xw.draw), ugc, winx,
-				winy + dc.font.ascent + 1, width, wlw);
+				winy + dc.font.ascent * chscale + 1, width, wlw);
 		} else if (base.ustyle == 3) {
 			int ww = win.cw;//width;
 			int wh = dc.font.descent - wlw/2 - 1;//r.height/7;
@@ -1890,6 +2080,7 @@ xdrawglyphfontspecs(const XftGlyphFontSpec *specs, Glyph base, int len, int x, i
 			wy -= win.cyo;
 			#endif // VERTCENTER_PATCH
 
+#if UNDERCURL_STYLE == UNDERCURL_CURLY
 			// Draw waves
 			int narcs = charlen * 2 + 1;
 			XArc *arcs = xmalloc(sizeof(XArc) * narcs);
@@ -1927,24 +2118,284 @@ xdrawglyphfontspecs(const XftGlyphFontSpec *specs, Glyph base, int len, int x, i
 			XDrawArcs(xw.dpy, XftDrawDrawable(xw.draw), ugc, arcs, narcs);
 
 			free(arcs);
+#elif UNDERCURL_STYLE == UNDERCURL_SPIKY
+			// Make the underline corridor larger
+			/*
+			wy -= wh;
+			*/
+			wh *= 2;
+
+			// Set the angle of the slope to 45°
+			ww = wh;
+
+			// Position of wave is independent of word, it's absolute
+			wx = (wx / (ww/2)) * (ww/2);
+
+			int marginStart = winx - wx;
+
+			// Calculate number of points with floating precision
+			float n = width;					// Width of word in pixels
+			n = (n / ww) * 2;					// Number of slopes (/ or \)
+			n += 2;								// Add two last points
+			int npoints = n;					// Convert to int
+
+			// Total length of underline
+			float waveLength = 0;
+
+			if (npoints >= 3) {
+				// We add an aditional slot in case we use a bonus point
+				XPoint *points = xmalloc(sizeof(XPoint) * (npoints + 1));
+
+				// First point (Starts with the word bounds)
+				points[0] = (XPoint) {
+					.x = wx + marginStart,
+					.y = (isSlopeRising(wx, 0, ww))
+						? (wy - marginStart + ww/2.f)
+						: (wy + marginStart)
+				};
+
+				// Second point (Goes back to the absolute point coordinates)
+				points[1] = (XPoint) {
+					.x = (ww/2.f) - marginStart,
+					.y = (isSlopeRising(wx, 1, ww))
+						? (ww/2.f - marginStart)
+						: (-ww/2.f + marginStart)
+				};
+				waveLength += (ww/2.f) - marginStart;
+
+				// The rest of the points
+				for (int i = 2; i < npoints-1; i++) {
+					points[i] = (XPoint) {
+						.x = ww/2,
+						.y = (isSlopeRising(wx, i, ww))
+							? wh/2
+							: -wh/2
+					};
+					waveLength += ww/2;
+				}
+
+				// Last point
+				points[npoints-1] = (XPoint) {
+					.x = ww/2,
+					.y = (isSlopeRising(wx, npoints-1, ww))
+						? wh/2
+						: -wh/2
+				};
+				waveLength += ww/2;
+
+				// End
+				if (waveLength < width) { // Add a bonus point?
+					int marginEnd = width - waveLength;
+					points[npoints] = (XPoint) {
+						.x = marginEnd,
+						.y = (isSlopeRising(wx, npoints, ww))
+							? (marginEnd)
+							: (-marginEnd)
+					};
+
+					npoints++;
+				} else if (waveLength > width) { // Is last point too far?
+					int marginEnd = waveLength - width;
+					points[npoints-1].x -= marginEnd;
+					if (isSlopeRising(wx, npoints-1, ww))
+						points[npoints-1].y -= (marginEnd);
+					else
+						points[npoints-1].y += (marginEnd);
+				}
+
+				// Draw the lines
+				XDrawLines(xw.dpy, XftDrawDrawable(xw.draw), ugc, points, npoints,
+						CoordModePrevious);
+
+				// Draw a second underline with an offset of 1 pixel
+				if ( ((win.ch / (widthThreshold/2)) % 2)) {
+					points[0].x++;
+
+					XDrawLines(xw.dpy, XftDrawDrawable(xw.draw), ugc, points,
+							npoints, CoordModePrevious);
+				}
+
+				// Free resources
+				free(points);
+			}
+#else // UNDERCURL_CAPPED
+			// Cap is half of wave width
+			float capRatio = 0.5f;
+
+			// Make the underline corridor larger
+			wh *= 2;
+
+			// Set the angle of the slope to 45°
+			ww = wh;
+			ww *= 1 + capRatio; // Add a bit of width for the cap
+
+			// Position of wave is independent of word, it's absolute
+			wx = (wx / ww) * ww;
+
+			float marginStart;
+			switch(getSlope(winx, 0, ww)) {
+				case UNDERCURL_SLOPE_ASCENDING:
+					marginStart = winx - wx;
+					break;
+				case UNDERCURL_SLOPE_TOP_CAP:
+					marginStart = winx - (wx + (ww * (2.f/6.f)));
+					break;
+				case UNDERCURL_SLOPE_DESCENDING:
+					marginStart = winx - (wx + (ww * (3.f/6.f)));
+					break;
+				case UNDERCURL_SLOPE_BOTTOM_CAP:
+					marginStart = winx - (wx + (ww * (5.f/6.f)));
+					break;
+			}
+
+			// Calculate number of points with floating precision
+			float n = width;					// Width of word in pixels
+												//					   ._.
+			n = (n / ww) * 4;					// Number of points (./   \.)
+			n += 2;								// Add two last points
+			int npoints = n;					// Convert to int
+
+			// Position of the pen to draw the lines
+			float penX = 0;
+			float penY = 0;
+
+			if (npoints >= 3) {
+				XPoint *points = xmalloc(sizeof(XPoint) * (npoints + 1));
+
+				// First point (Starts with the word bounds)
+				penX = winx;
+				switch (getSlope(winx, 0, ww)) {
+					case UNDERCURL_SLOPE_ASCENDING:
+						penY = wy + wh/2.f - marginStart;
+						break;
+					case UNDERCURL_SLOPE_TOP_CAP:
+						penY = wy;
+						break;
+					case UNDERCURL_SLOPE_DESCENDING:
+						penY = wy + marginStart;
+						break;
+					case UNDERCURL_SLOPE_BOTTOM_CAP:
+						penY = wy + wh/2.f;
+						break;
+				}
+				points[0].x = penX;
+				points[0].y = penY;
+
+				// Second point (Goes back to the absolute point coordinates)
+				switch (getSlope(winx, 1, ww)) {
+					case UNDERCURL_SLOPE_ASCENDING:
+						penX += ww * (1.f/6.f) - marginStart;
+						penY += 0;
+						break;
+					case UNDERCURL_SLOPE_TOP_CAP:
+						penX += ww * (2.f/6.f) - marginStart;
+						penY += -wh/2.f + marginStart;
+						break;
+					case UNDERCURL_SLOPE_DESCENDING:
+						penX += ww * (1.f/6.f) - marginStart;
+						penY += 0;
+						break;
+					case UNDERCURL_SLOPE_BOTTOM_CAP:
+						penX += ww * (2.f/6.f) - marginStart;
+						penY += -marginStart + wh/2.f;
+						break;
+				}
+				points[1].x = penX;
+				points[1].y = penY;
+
+				// The rest of the points
+				for (int i = 2; i < npoints; i++) {
+					switch (getSlope(winx, i, ww)) {
+						case UNDERCURL_SLOPE_ASCENDING:
+						case UNDERCURL_SLOPE_DESCENDING:
+							penX += ww * (1.f/6.f);
+							penY += 0;
+							break;
+						case UNDERCURL_SLOPE_TOP_CAP:
+							penX += ww * (2.f/6.f);
+							penY += -wh / 2.f;
+							break;
+						case UNDERCURL_SLOPE_BOTTOM_CAP:
+							penX += ww * (2.f/6.f);
+							penY += wh / 2.f;
+							break;
+					}
+					points[i].x = penX;
+					points[i].y = penY;
+				}
+
+				// End
+				float waveLength = penX - winx;
+				if (waveLength < width) { // Add a bonus point?
+					int marginEnd = width - waveLength;
+					penX += marginEnd;
+					switch(getSlope(winx, npoints, ww)) {
+						case UNDERCURL_SLOPE_ASCENDING:
+						case UNDERCURL_SLOPE_DESCENDING:
+							//penY += 0;
+							break;
+						case UNDERCURL_SLOPE_TOP_CAP:
+							penY += -marginEnd;
+							break;
+						case UNDERCURL_SLOPE_BOTTOM_CAP:
+							penY += marginEnd;
+							break;
+					}
+
+					points[npoints].x = penX;
+					points[npoints].y = penY;
+
+					npoints++;
+				} else if (waveLength > width) { // Is last point too far?
+					int marginEnd = waveLength - width;
+					points[npoints-1].x -= marginEnd;
+					switch(getSlope(winx, npoints-1, ww)) {
+						case UNDERCURL_SLOPE_TOP_CAP:
+							points[npoints-1].y += marginEnd;
+							break;
+						case UNDERCURL_SLOPE_BOTTOM_CAP:
+							points[npoints-1].y -= marginEnd;
+							break;
+						default:
+							break;
+					}
+				}
+
+				// Draw the lines
+				XDrawLines(xw.dpy, XftDrawDrawable(xw.draw), ugc, points, npoints,
+						CoordModeOrigin);
+
+				// Draw a second underline with an offset of 1 pixel
+				if ( ((win.ch / (widthThreshold/2)) % 2)) {
+					for (int i = 0; i < npoints; i++)
+						points[i].x++;
+
+					XDrawLines(xw.dpy, XftDrawDrawable(xw.draw), ugc, points,
+							npoints, CoordModeOrigin);
+				}
+
+				// Free resources
+				free(points);
+			}
+#endif
 		}
 
 		XFreeGC(xw.dpy, ugc);
 		#elif VERTCENTER_PATCH
-		XftDrawRect(xw.draw, fg, winx, winy + win.cyo + dc.font.ascent + 1,
+		XftDrawRect(xw.draw, fg, winx, winy + win.cyo + dc.font.ascent * chscale + 1,
 				width, 1);
 		#else
-		XftDrawRect(xw.draw, fg, winx, winy + dc.font.ascent + 1,
+		XftDrawRect(xw.draw, fg, winx, winy + dc.font.ascent * chscale + 1,
 				width, 1);
 		#endif // UNDERCURL_PATCH | VERTCENTER_PATCH
 	}
 
 	if (base.mode & ATTR_STRUCK) {
 		#if VERTCENTER_PATCH
-		XftDrawRect(xw.draw, fg, winx, winy + win.cyo + 2 * dc.font.ascent / 3,
+		XftDrawRect(xw.draw, fg, winx, winy + win.cyo + 2 * dc.font.ascent * chscale / 3,
 				width, 1);
 		#else
-		XftDrawRect(xw.draw, fg, winx, winy + 2 * dc.font.ascent / 3,
+		XftDrawRect(xw.draw, fg, winx, winy + 2 * dc.font.ascent * chscale / 3,
 				width, 1);
 		#endif // VERTCENTER_PATCH
 	}
@@ -1952,10 +2403,30 @@ xdrawglyphfontspecs(const XftGlyphFontSpec *specs, Glyph base, int len, int x, i
 	}
 	#endif // WIDE_GLYPHS_PATCH
 
-	#if !WIDE_GLYPHS_PATCH
+	#if OPENURLONCLICK_PATCH
+	if (url_draw && y >= url_y1 && y <= url_y2) {
+		int x1 = (y == url_y1) ? url_x1 : 0;
+		int x2 = (y == url_y2) ? MIN(url_x2, term.col-1) : url_maxcol;
+		if (x + charlen > x1 && x <= x2) {
+			int xu = MAX(x, x1);
+			int wu = (x2 - xu + 1) * win.cw;
+			#if ANYSIZE_PATCH
+			xu = win.hborderpx + xu * win.cw;
+			#else
+			xu = borderpx + xu * win.cw;
+			#endif // ANYSIZE_PATCH
+			#if VERTCENTER_PATCH
+			XftDrawRect(xw.draw, fg, xu, winy + win.cyo + dc.font.ascent * chscale + 2, wu, 1);
+			#else
+			XftDrawRect(xw.draw, fg, xu, winy + dc.font.ascent * chscale + 2, wu, 1);
+			#endif // VERTCENTER_PATCH
+			url_draw = (y != url_y2 || x + charlen <= x2);
+		}
+	}
+	#endif // OPENURLONCLICK_PATCH
+
 	/* Reset clip to none. */
 	XftDrawSetClip(xw.draw, 0);
-	#endif // WIDE_GLYPHS_PATCH
 }
 
 void
@@ -1995,8 +2466,13 @@ xdrawcursor(int cx, int cy, Glyph g, int ox, int oy, Glyph og)
 	xdrawglyph(og, ox, oy);
 	#endif // LIGATURES_PATCH
 
+	#if HIDE_TERMINAL_CURSOR_PATCH
+	if (IS_SET(MODE_HIDE) || !IS_SET(MODE_FOCUSED))
+		return;
+	#else
 	if (IS_SET(MODE_HIDE))
 		return;
+	#endif // HIDE_TERMINAL_CURSOR_PATCH
 
 	/*
 	 * Select the right color for the right mode.
@@ -2021,17 +2497,21 @@ xdrawcursor(int cx, int cy, Glyph g, int ox, int oy, Glyph og)
 		if (selected(cx, cy)) {
 			g.fg = defaultfg;
 			g.bg = defaultrcs;
-		} else {
-			#if DYNAMIC_CURSOR_COLOR_PATCH
-			g.bg = g.fg;
-			g.fg = defaultbg;
-			#else
+		}
+		#if !DYNAMIC_CURSOR_COLOR_PATCH
+		else {
 			g.fg = defaultbg;
 			g.bg = defaultcs;
-			#endif // DYNAMIC_CURSOR_COLOR_PATCH
 		}
 
-		#if DYNAMIC_CURSOR_COLOR_PATCH
+		drawcol = dc.col[g.bg];
+		#else
+		else if (!(og.mode & ATTR_REVERSE)) {
+			unsigned int tmpcol = g.bg;
+			g.bg = g.fg;
+			g.fg = tmpcol;
+		}
+
 		if (IS_TRUECOL(g.bg)) {
 			colbg.alpha = 0xffff;
 			colbg.red = TRUERED(g.bg);
@@ -2040,8 +2520,6 @@ xdrawcursor(int cx, int cy, Glyph g, int ox, int oy, Glyph og)
 			XftColorAllocValue(xw.dpy, xw.vis, xw.cmap, &colbg, &drawcol);
 		} else
 			drawcol = dc.col[g.bg];
-		#else
-		drawcol = dc.col[g.bg];
 		#endif // DYNAMIC_CURSOR_COLOR_PATCH
 	}
 
@@ -2167,25 +2645,73 @@ xseticontitle(char *p)
 	XTextProperty prop;
 	DEFAULT(p, opt_title);
 
-	Xutf8TextListToTextProperty(xw.dpy, &p, 1, XUTF8StringStyle,
-			&prop);
+	if (Xutf8TextListToTextProperty(xw.dpy, &p, 1, XUTF8StringStyle,
+			&prop) != Success)
+		return;
 	XSetWMIconName(xw.dpy, xw.win, &prop);
 	XSetTextProperty(xw.dpy, xw.win, &prop, xw.netwmiconname);
 	XFree(prop.value);
 }
 
+#if CSI_22_23_PATCH
+void
+xsettitle(char *p, int pop)
+{
+	XTextProperty prop;
+
+	free(titlestack[tstki]);
+	if (pop) {
+		titlestack[tstki] = NULL;
+		tstki = (tstki - 1 + TITLESTACKSIZE) % TITLESTACKSIZE;
+		p = titlestack[tstki] ? titlestack[tstki] : opt_title;
+	} else if (p) {
+		titlestack[tstki] = xstrdup(p);
+	} else {
+		titlestack[tstki] = NULL;
+		p = opt_title;
+	}
+
+	if (Xutf8TextListToTextProperty(xw.dpy, &p, 1, XUTF8StringStyle,
+			&prop) != Success)
+		return;
+	XSetWMName(xw.dpy, xw.win, &prop);
+	XSetTextProperty(xw.dpy, xw.win, &prop, xw.netwmname);
+	XFree(prop.value);
+}
+
+void
+xpushtitle(void)
+{
+	int tstkin = (tstki + 1) % TITLESTACKSIZE;
+
+	free(titlestack[tstkin]);
+	titlestack[tstkin] = titlestack[tstki] ? xstrdup(titlestack[tstki]) : NULL;
+	tstki = tstkin;
+}
+
+void
+xfreetitlestack(void)
+{
+	for (int i = 0; i < LEN(titlestack); i++) {
+		free(titlestack[i]);
+		titlestack[i] = NULL;
+	}
+}
+#else
 void
 xsettitle(char *p)
 {
 	XTextProperty prop;
 	DEFAULT(p, opt_title);
 
-	Xutf8TextListToTextProperty(xw.dpy, &p, 1, XUTF8StringStyle,
-			&prop);
+	if (Xutf8TextListToTextProperty(xw.dpy, &p, 1, XUTF8StringStyle,
+			&prop) != Success)
+		return;
 	XSetWMName(xw.dpy, xw.win, &prop);
 	XSetTextProperty(xw.dpy, xw.win, &prop, xw.netwmname);
 	XFree(prop.value);
 }
+#endif // CSI_22_23_PATCH
 
 int
 xstartdraw(void)
@@ -2276,21 +2802,9 @@ xfinishdraw(void)
 {
 	#if SIXEL_PATCH
 	ImageList *im;
-	int x, y;
-	int n = 0;
-	int nlimit = 256;
-	XRectangle *rects = NULL;
 	XGCValues gcvalues;
 	GC gc;
 	#endif // SIXEL_PATCH
-
-	#if !SINGLE_DRAWABLE_BUFFER_PATCH
-	XCopyArea(xw.dpy, xw.buf, xw.win, dc.gc, 0, 0, win.w,
-			win.h, 0, 0);
-	#endif // SINGLE_DRAWABLE_BUFFER_PATCH
-	XSetForeground(xw.dpy, dc.gc,
-			dc.col[IS_SET(MODE_REVERSE)?
-				defaultfg : defaultbg].pixel);
 
 	#if SIXEL_PATCH
 	for (im = term.images; im; im = im->next) {
@@ -2342,18 +2856,25 @@ xfinishdraw(void)
 			im->pixels = NULL;
 		}
 
-		n = 0;
 		memset(&gcvalues, 0, sizeof(gcvalues));
 		gc = XCreateGC(xw.dpy, xw.win, 0, &gcvalues);
 
+		#if ANYSIZE_PATCH
+		XCopyArea(xw.dpy, (Drawable)im->pixmap, xw.buf, gc, 0, 0, im->width, im->height, win.hborderpx + im->x * win.cw, win.vborderpx + im->y * win.ch);
+		#else
 		XCopyArea(xw.dpy, (Drawable)im->pixmap, xw.buf, gc, 0, 0, im->width, im->height, borderpx + im->x * win.cw, borderpx + im->y * win.ch);
+		#endif // ANYSIZE_PATCH
 		XFreeGC(xw.dpy, gc);
 
 	}
-
-	free(rects);
-	drawregion(0, 0, term.col, term.row);
 	#endif // SIXEL_PATCH
+
+	#if !SINGLE_DRAWABLE_BUFFER_PATCH
+	XCopyArea(xw.dpy, xw.buf, xw.win, dc.gc, 0, 0, win.w, win.h, 0, 0);
+	#endif // SINGLE_DRAWABLE_BUFFER_PATCH
+	XSetForeground(xw.dpy, dc.gc,
+			dc.col[IS_SET(MODE_REVERSE)?
+				defaultfg : defaultbg].pixel);
 }
 
 void
@@ -2402,6 +2923,9 @@ xsetpointermotion(int set)
 	if (!set && !xw.pointerisvisible)
 		return;
 	#endif // HIDECURSOR_PATCH
+	#if OPENURLONCLICK_PATCH
+	set = 1; /* keep MotionNotify event enabled */
+	#endif // OPENURLONCLICK_PATCH
 	MODBIT(xw.attrs.event_mask, set, PointerMotionMask);
 	XChangeWindowAttributes(xw.dpy, xw.win, CWEventMask, &xw.attrs);
 }
@@ -2420,8 +2944,15 @@ xsetmode(int set, unsigned int flags)
 		if (win.mode & MODE_MOUSE)
 			XUndefineCursor(xw.dpy, xw.win);
 		else
+			#if HIDECURSOR_PATCH
+			XDefineCursor(xw.dpy, xw.win, xw.vpointer);
+			#else
 			XDefineCursor(xw.dpy, xw.win, cursor);
+			#endif // HIDECURSOR_PATCH
 	}
+	#elif OPENURLONCLICK_PATCH
+	if (win.mode & MODE_MOUSE && xw.pointerisvisible)
+		XDefineCursor(xw.dpy, xw.win, xw.vpointer);
 	#endif // SWAPMOUSE_PATCH
 	if ((win.mode & MODE_REVERSE) != (mode & MODE_REVERSE))
 		redraw();
@@ -2504,7 +3035,7 @@ focus(XEvent *ev)
 		if (!focused) {
 			focused = 1;
 			xloadcols();
-			redraw();
+			tfulldirt();
 		}
 		#endif // ALPHA_FOCUS_HIGHLIGHT_PATCH
 	} else {
@@ -2517,7 +3048,7 @@ focus(XEvent *ev)
 		if (focused) {
 			focused = 0;
 			xloadcols();
-			redraw();
+			tfulldirt();
 		}
 		#endif // ALPHA_FOCUS_HIGHLIGHT_PATCH
 	}
@@ -2570,28 +3101,48 @@ void
 kpress(XEvent *ev)
 {
 	XKeyEvent *e = &ev->xkey;
-	KeySym ksym;
+	KeySym ksym = NoSymbol;
 	char buf[64], *customkey;
-	int len;
+	int len, screen;
 	Rune c;
 	Status status;
 	Shortcut *bp;
 
 	#if HIDECURSOR_PATCH
 	if (xw.pointerisvisible) {
+		#if OPENURLONCLICK_PATCH
+		#if ANYSIZE_PATCH
+		int x = e->x - win.hborderpx;
+		int y = e->y - win.vborderpx;
+		#else
+		int x = e->x - borderpx;
+		int y = e->y - borderpx;
+		#endif // ANYSIZE_PATCH
+		LIMIT(x, 0, win.tw - 1);
+		LIMIT(y, 0, win.th - 1);
+		if (!detecturl(x / win.cw, y / win.ch, 0)) {
+			XDefineCursor(xw.dpy, xw.win, xw.bpointer);
+			xsetpointermotion(1);
+			xw.pointerisvisible = 0;
+		}
+		#else
 		XDefineCursor(xw.dpy, xw.win, xw.bpointer);
 		xsetpointermotion(1);
 		xw.pointerisvisible = 0;
+		#endif // OPENURLONCLICK_PATCH
 	}
 	#endif // HIDECURSOR_PATCH
 
 	if (IS_SET(MODE_KBDLOCK))
 		return;
 
-	if (xw.ime.xic)
+	if (xw.ime.xic) {
 		len = XmbLookupString(xw.ime.xic, e, buf, sizeof buf, &ksym, &status);
-	else
+		if (status == XBufferOverflow)
+			return;
+	} else {
 		len = XLookupString(e, buf, sizeof buf, &ksym, NULL);
+	}
 	#if KEYBOARDSELECT_PATCH
 	if ( IS_SET(MODE_KBDSELECT) ) {
 		if ( match(XK_NO_MOD, e->state) ||
@@ -2608,9 +3159,12 @@ kpress(XEvent *ev)
 	}
 	#endif // VIM_BROWSE_PATCH
 
+	screen = tisaltscr() ? S_ALT : S_PRI;
+
 	/* 1. shortcuts */
 	for (bp = shortcuts; bp < shortcuts + LEN(shortcuts); bp++) {
-		if (ksym == bp->keysym && match(bp->mod, e->state)) {
+		if (ksym == bp->keysym && match(bp->mod, e->state) &&
+				(!bp->screen || bp->screen == screen)) {
 			bp->func(&(bp->arg));
 			return;
 		}
@@ -2668,6 +3222,15 @@ resize(XEvent *e)
 	XWindowChanges wc;
 	#endif // ST_EMBEDDER_PATCH
 
+	#if BACKGROUND_IMAGE_PATCH
+	if (pseudotransparency) {
+		if (e->xconfigure.width == win.w &&
+			e->xconfigure.height == win.h &&
+			e->xconfigure.x == win.x && e->xconfigure.y == win.y)
+			return;
+		updatexy();
+	} else
+	#endif // BACKGROUND_IMAGE_PATCH
 	if (e->xconfigure.width == win.w && e->xconfigure.height == win.h)
 		return;
 
@@ -2819,13 +3382,6 @@ run(void)
 			}
 		}
 
-		#if ANYSIZE_NOBAR_PATCH
-		/* Refresh before drawing */
-		cresize(0, 0);
-		redraw();
-		xhints();
-		#endif // ANYSIZE_NOBAR_PATCH
-
 		#if VISUALBELL_1_PATCH
 		if (bellon) {
 			bellon++;
@@ -2938,14 +3494,15 @@ run:
 
 	setlocale(LC_CTYPE, "");
 	XSetLocaleModifiers("");
-	#if XRESOURCES_RELOAD_PATCH && XRESOURCES_PATCH
-	reload_config(-1);
-	#elif XRESOURCES_PATCH
+	#if XRESOURCES_PATCH && XRESOURCES_RELOAD_PATCH || BACKGROUND_IMAGE_PATCH && BACKGROUND_IMAGE_RELOAD_PATCH
+	signal(SIGUSR1, sigusr1_reload);
+	#endif // XRESOURCES_RELOAD_PATCH | BACKGROUND_IMAGE_RELOAD_PATCH
+	#if XRESOURCES_PATCH
 	if (!(xw.dpy = XOpenDisplay(NULL)))
 		die("Can't open display\n");
 
-	config_init();
-	#endif // XRESOURCES_RELOAD_PATCH
+	config_init(xw.dpy);
+	#endif // XRESOURCES_PATCH
 	cols = MAX(cols, 1);
 	rows = MAX(rows, 1);
 	#if ALPHA_PATCH && ALPHA_FOCUS_HIGHLIGHT_PATCH
@@ -2953,6 +3510,9 @@ run:
 	#endif // ALPHA_FOCUS_HIGHLIGHT_PATCH
 	tnew(cols, rows);
 	xinit(cols, rows);
+	#if BACKGROUND_IMAGE_PATCH
+	bginit();
+	#endif // BACKGROUND_IMAGE_PATCH
 	xsetenv();
 	selinit();
 	#if WORKINGDIR_PATCH
